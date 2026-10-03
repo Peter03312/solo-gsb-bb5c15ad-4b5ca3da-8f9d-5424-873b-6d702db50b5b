@@ -143,6 +143,12 @@ CREATE TABLE IF NOT EXISTS rooms (
   -- 讨论停点自动暂停时固化的停点时码；非停点自动暂停状态为 NULL。
   -- 与超载触发落库同一口径：惰性落库、不增加控制修订号，重启后据此恢复暂停原因。
   stopped_time       REAL,
+  -- 预约启播：到点自动启播的墙钟时刻（playing=0 时惰性触发，触发后清除并保留
+  -- last_auto_start_wall 供状态展示）；无待生效预约时为 NULL。
+  scheduled_start_wall REAL,
+  -- 最近一次预约到点自动启播实际生效的墙钟时刻（仅用于房间状态展示启播结果；
+  -- 成功的手动控制/重新预约/取消后清除），NULL = 自上次手动控制后没有自动启播过。
+  last_auto_start_wall REAL,
   created_at  REAL NOT NULL
 );
 
@@ -186,6 +192,20 @@ CREATE TABLE IF NOT EXISTS room_stops (
   room_id INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
   stops   TEXT NOT NULL                      -- JSON：升序、不重复的非负演出时码数组
 );
+
+-- 共享房间「预约启播」：暂停房间的主持人凭当前控制密钥与房间修订号，预约一个未来
+-- 墙钟时刻（start_wall，Date.now()/1000 秒），到点按既有播放规则从当时断点启动。
+-- 同一房间只保留最近一次预约（以 room_id 为主键，再次预约 UPSERT 即覆盖旧预约）；
+-- 主持人可取消（DELETE 本行）。预约与取消各使房间修订号 +1（与成功控制同一口径，
+-- 已发出的交接凭证随修订号前进而作废）；主持权交接不影响预约（行原样保留）。
+-- 到点自动启播是时间流逝的结果：惰性触发（GET/控制/服务重启后首次查询），触发时
+-- 本行删除、修订号不变；服务重启或首次查询晚于预约时刻时仍按预约时刻起算墙钟进度。
+-- 任何成功的手动控制（play/pause/seek/speed）、提交/取消循环排演都会取消待生效预约。
+CREATE TABLE IF NOT EXISTS room_schedules (
+  room_id    INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+  start_wall REAL NOT NULL,                  -- 预约启播的未来墙钟秒（Date.now()/1000）
+  created_at REAL NOT NULL                   -- 预约提交时的墙钟秒
+);
 `;
 
 let db;
@@ -215,6 +235,13 @@ function migrate(database) {
     // 讨论停点自动暂停落库列：旧库补列（NULL = 非停点自动暂停状态）
     if (!roomCols.includes('stopped_time')) {
       database.exec('ALTER TABLE rooms ADD COLUMN stopped_time REAL');
+    }
+    // 预约启播：旧库补列（NULL = 无待生效预约 / 无最近自动启播记录）
+    if (!roomCols.includes('scheduled_start_wall')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN scheduled_start_wall REAL');
+    }
+    if (!roomCols.includes('last_auto_start_wall')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN last_auto_start_wall REAL');
     }
   }
 }

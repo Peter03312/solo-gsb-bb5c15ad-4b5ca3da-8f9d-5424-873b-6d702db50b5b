@@ -708,6 +708,7 @@ async function enterRoom(code, key, initialView) {
   renderRoomHandover();
   renderRoomProgram();
   renderRoomStops();
+  renderRoomSchedule();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -745,6 +746,31 @@ function roomProgramProjection(view, targetLinear) {
 function roomCurrentTime(nowSec) {
   const r = state.room;
   const a = r.anchor;
+  // 预约启播已到点但下次轮询尚未同步：本地先按预约墙钟起算（与服务端惰性触发同规则），
+  // 让播放画面在到点瞬间即开始推进；下一次每秒轮询由服务端纠正锚点
+  const sch = r.view.schedule;
+  if (!a.playing && sch && sch.active && nowSec >= sch.start_wall) {
+    const p = r.view.program;
+    if (p && p.finished) {
+      // 已完成的循环排演到点从首段重来（服务端会重置段/轮，轮询后纠正）
+      const first = p.segments[0];
+      const rr = window.LightingProgram.advanceProgram(
+        { segIndex: 0, iteration: 0, time: first.start, finished: false },
+        p.segments,
+        first.start + Math.max(0, nowSec - sch.start_wall) * a.speed,
+        null
+      );
+      return rr.time;
+    }
+    const virtual = { wall: sch.start_wall, time: sch.from_time, speed: a.speed, playing: true };
+    return projectRoomTime(virtual, nowSec);
+  }
+  return projectRoomTime(a, nowSec);
+}
+
+// 按锚点把本地墙钟映射为房间演出时码（含循环排演、超载边界与讨论停点的本地不越过）
+function projectRoomTime(a, nowSec) {
+  const r = state.room;
   if (!a.playing) return Math.min(a.time, r.view.duration);
   let linear = a.time + Math.max(0, nowSec - a.wall) * a.speed;
   if (r.view.program && !r.view.program.finished) {
@@ -799,6 +825,7 @@ async function pollRoom() {
     renderRoomHandover();
     renderRoomProgram();
     renderRoomStops();
+    renderRoomSchedule();
     updateRoomHandoverCountdown();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
@@ -925,6 +952,7 @@ function renderRoom() {
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
   updateRoomHandoverCountdown();
+  updateRoomScheduleCountdown();
   updateRoomProgramStatus(t);
   renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
 }
@@ -1213,6 +1241,9 @@ function renderRoomStops() {
   if (isHost && document.activeElement !== input) {
     input.value = points.join(' ');
   }
+
+  // 预约启播状态条与停点状态条同一刷新节奏（轮询/控制后均联动更新）
+  renderRoomScheduleBar();
 }
 
 // 解析停点输入：逗号/空白分隔的非负时码列表；返回 { stops } 或 { error }
@@ -1513,6 +1544,167 @@ function updateRoomHandoverCountdown() {
   const ss = String(total % 60).padStart(2, '0');
   el.textContent = `${mm}:${ss}`;
 }
+
+/* --------------------------- 预约启播 --------------------------- */
+// 暂停房间的主持人可预约未来墙钟时刻自动启播：到点按现有播放规则从当时断点启动
+// （已完成的循环排演从首段重来），自动启播不增加修订号；同一房间只保留最近一次
+// 预约，也可取消（各使修订号 +1）。观看者只读查看预约状态与启播结果。
+
+const SCHEDULE_BAR_ID = 'room-schedule-countdown';
+
+// 本地墙钟 -> datetime-local 输入值（本地时区，秒精度）
+function wallToLocalInput(wallSec) {
+  const d = new Date(wallSec * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function fmtWall(wallSec) {
+  return new Date(wallSec * 1000).toLocaleString('zh-CN', { hour12: false });
+}
+
+function fmtCountdown(sec) {
+  const total = Math.max(0, Math.ceil(sec));
+  const h = Math.floor(total / 3600);
+  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+  const ss = String(total % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// 预约启播卡：主持人编辑区 / 观看者只读
+function renderRoomSchedule() {
+  const r = state.room;
+  if (!r) return;
+  const isHost = !!r.key;
+  $('room-schedule-host').hidden = !isHost;
+  $('room-schedule-viewer').hidden = isHost;
+  const input = $('room-schedule-at');
+  if (isHost && document.activeElement !== input && !input.value) {
+    // 默认预填“两分钟后”，方便一键预约
+    input.value = wallToLocalInput(Date.now() / 1000 + 120);
+  }
+  renderRoomScheduleBar();
+}
+
+// 预约状态条（控制卡内）：待生效倒计时 / 启播结果（播放中·停点·超载·末尾）/ 无预约
+function renderRoomScheduleBar() {
+  const r = state.room;
+  const box = $('room-schedule');
+  if (!r || !box) return;
+  const sch = r.view.schedule;
+
+  if (sch && sch.active) {
+    box.hidden = false;
+    box.className = 'room-schedule is-armed';
+    const remain = Math.max(0, sch.start_wall - Date.now() / 1000);
+    box.innerHTML =
+      '<span class="rp-title">⏰ 已预约自动启播</span>' +
+      `到点从演出时码 <b>${fmt(sch.from_time)}</b> s 的断点按当前倍速自动开播（自动启播不增加修订号）：` +
+      `<b>${esc(fmtWall(sch.start_wall))}</b>，剩余 <b id="${SCHEDULE_BAR_ID}">${fmtCountdown(remain)}</b>。` +
+      '成功的手动控制会取消预约；主持权交接保留预约。';
+  } else if (sch && sch.fired) {
+    const stopped = sch.result && sch.result !== 'playing';
+    box.hidden = false;
+    box.className = `room-schedule ${stopped ? 'is-stopped' : 'is-fired'}`;
+    const head = stopped ? '⏸ 预约启播后已自动停住' : '▶ 预约启播已生效';
+    box.innerHTML =
+      `<span class="rp-title">${head}</span>` +
+      `${esc(sch.reason_text || '')} 启播时刻 <b>${esc(fmtWall(sch.started_at))}</b>` +
+      '（自动启播不增加修订号；下次成功手动控制后此提示消失）。';
+  } else {
+    box.hidden = false;
+    box.className = 'room-schedule is-off';
+    box.innerHTML =
+      '<span class="rp-title">预约启播：未安排</span>房间暂停时，主持人可在下方「预约启播」卡预约一个未来墙钟时刻自动开播。';
+  }
+}
+
+function updateRoomScheduleCountdown() {
+  const r = state.room;
+  const el = document.getElementById(SCHEDULE_BAR_ID);
+  if (!r || !el) return;
+  const sch = r.view.schedule;
+  if (!sch || !sch.active) return;
+  el.textContent = fmtCountdown(Math.max(0, sch.start_wall - Date.now() / 1000));
+}
+
+// 提交预约（同一房间只保留最近一次；携带控制密钥与当前修订号）
+async function submitRoomSchedule(startAt) {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-schedule-error'), '观看者不能预约启播：请先输入控制密钥。');
+  clearErr($('room-schedule-error'));
+  try {
+    const view = await api('PUT', `/api/rooms/${encodeURIComponent(r.view.code)}/schedule`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      start_at: startAt,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+    renderRoomStops();
+  } catch (e) {
+    if (e.status === 409) await pollRoom();
+    else if (e.status === 403) {
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+      renderRoomRole();
+    }
+    renderRoomStops();
+    showErr($('room-schedule-error'), `预约启播失败：${e.message}`);
+  }
+}
+
+$('btn-room-schedule-set').addEventListener('click', () => {
+  const r = state.room;
+  if (!r) return;
+  const raw = $('room-schedule-at').value;
+  if (!raw) return showErr($('room-schedule-error'), '请选择未来的启播时刻。');
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return showErr($('room-schedule-error'), '启播时刻无效。');
+  submitRoomSchedule(ms / 1000);
+});
+
+$('btn-room-schedule-cancel').addEventListener('click', async () => {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-schedule-error'), '观看者不能取消预约。');
+  if (!(r.view.schedule && r.view.schedule.active)) {
+    return showErr($('room-schedule-error'), '当前没有待生效的预约启播。');
+  }
+  clearErr($('room-schedule-error'));
+  try {
+    const view = await api('DELETE', `/api/rooms/${encodeURIComponent(r.view.code)}/schedule`, {
+      control_key: r.key,
+      revision: r.view.revision,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+    renderRoomStops();
+  } catch (e) {
+    if (e.status === 409) await pollRoom();
+    else if (e.status === 403) {
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+      renderRoomRole();
+    }
+    renderRoomStops();
+    showErr($('room-schedule-error'), `取消预约失败：${e.message}`);
+  }
+});
 
 /* ----------------------------- 版本比对 ----------------------------- */
 
