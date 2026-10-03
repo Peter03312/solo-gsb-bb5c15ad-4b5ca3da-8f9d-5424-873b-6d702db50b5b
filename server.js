@@ -1395,6 +1395,16 @@ app.post('/api/merge/commit', (req, res) => {
 // 暂停在该停点并惰性落库（stopped_time，不增加修订号），响应/页面显示触发原因；
 // 继续播放越过刚触发的停点，循环排演每次重新经过仍暂停，段尾瞬时跳转不触发被
 // 跳过的停点；与超载边界同时抵达时取先抵达者、同一时码优先超载。
+//
+// 定时启播：主持人可凭当前控制密钥与房间修订号，为【暂停的房间】预约一个未来墙钟
+// 时刻，到点按现有播放规则从当时断点启动（已完成的循环排演从首段重来）；同一房间
+// 只保留最近一次预约（再次预约覆盖旧预约），也可取消。预约与取消各使修订号 +1；
+// 自动启播不增加修订号。启播按【绝对墙钟】：服务重启或首次查询已晚于预约时刻时，
+// 仍以预约时刻为锚点起算进度，由现有惰性推算准确停在先遇到的讨论停点、超载边界或
+// 版本末尾；惰性启播与删除预约在同一事务完成，绝不重复启播。成功的手动控制 /
+// 循环排演提交 / 编排取消 / 停点维护都会取消待生效预约；主持权交接保留预约。
+// 无权、过期修订号、非未来时刻、播放中预约、不安全（已超载）起点都明确拒绝且
+// 房间不变。房间页面与 HTTP API 显示预约状态与启播结果，不泄露控制密钥。
 
 const ROOM_CODE_LEN = 6;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除 0/O/1/I 等易混字符
@@ -1557,6 +1567,12 @@ function getRoomStops(roomId) {
   } catch {
     return [];
   }
+}
+
+// 读取房间当前待生效的定时启播预约（无行 = 无预约，返回 null）
+function getRoomSchedule(roomId) {
+  const r = db.prepare('SELECT start_at FROM room_schedules WHERE room_id = ?').get(roomId);
+  return r ? { start_at: r.start_at } : null;
 }
 
 /**
@@ -1736,6 +1752,84 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
   };
 }
 
+/**
+ * 定时启播到点后的起点解析（与 /control 的 play 完全同一规则）：
+ *  - 循环排演已全部走完（finished）：从首段重新开始整次编排（progReset=true）；
+ *  - 循环排演进行中（暂停含断点）：从断点接续（progReset=false）；
+ *  - 普通房间且已停在版本末尾：再播放从头开始（0）；
+ *  - 其余（普通/编排暂停中）：从当前时码（断点）启动。
+ * 必须在房间暂停状态下调用（预约只允许暂停房间，启播行也只在暂停时生效）。
+ */
+function resolveScheduleStart(row, live, prog) {
+  let time = live.time;
+  let progReset = false;
+  if (prog) {
+    if (live.prog.finished) {
+      progReset = true;
+      time = prog.segments[0].start;
+    } else {
+      time = live.prog.time;
+    }
+  } else if (live.time >= row.duration) {
+    time = 0;
+  }
+  return { time, progReset };
+}
+
+/**
+ * 惰性启播事务：房间有待生效预约且当前墙钟已到点（now >= start_at）时，按预约的
+ * 【绝对墙钟】把房间置为播放中，并立即用 computeRoomState 以 start_at 为锚点推算
+ * 到 now——启播与预约删除在同一事务完成，因此无论重启后多久首次查询、多少请求
+ * 并发，都只会启播一次，且准确停在先遇到的讨论停点、超载边界或版本末尾。
+ * 自动启播不增加修订号；启播墙钟固化在 rooms.scheduled_start_at（页面/API 显示
+ * 启播结果，下一次成功的手动控制清除）。返回 true 表示本次调用发生了启播。
+ * 调用方须自行先取锁/事务；本函数自带事务（better-sqlite3 嵌套走 SAVEPOINT）。
+ */
+function activateDueScheduleTx(roomId, now) {
+  const sched = db.prepare('SELECT start_at FROM room_schedules WHERE room_id = ?').get(roomId);
+  if (!sched || sched.start_at > now + ROOM_EPS) return false;
+  const row = db.prepare(`${roomSelect} WHERE r.id = ?`).get(roomId);
+  if (!row || row.playing) {
+    // 房间已在播放（理论上预约应早已被手动控制删除）：只清理预约行，不重复启播
+    if (row) db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(roomId);
+    return false;
+  }
+
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
+  const prog = getRoomProgram(row.id);
+  const stops = getRoomStops(row.id);
+  // 暂停态实时推算（不会走动，live.time 即固化断点；此处主要取 prog.finished 状态）
+  const live = computeRoomState(row, { now, guard, prog, stops });
+  const { time: startTime, progReset } = resolveScheduleStart(row, live, prog);
+
+  // 以预约的绝对墙钟为锚点置为播放中（修订号不变；清除旧的自动暂停/启播标记）
+  db.prepare(
+    `UPDATE rooms
+     SET playing = 1, time = ?, anchor_wall = ?, revision = revision,
+         tripped_circuit_id = NULL, tripped_time = NULL, stopped_time = NULL,
+         scheduled_start_at = ?
+     WHERE id = ?`
+  ).run(startTime, sched.start_at, sched.start_at, row.id);
+  if (prog && progReset) {
+    // 已完成的循环排演从首段重来
+    db.prepare(
+      'UPDATE room_programs SET seg_index = 0, iteration = 0, prog_time = ?, finished = 0 WHERE room_id = ?'
+    ).run(prog.segments[0].start, row.id);
+  }
+  // 启播即删除预约行：与启播同一事务，杜绝重复启播
+  db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(row.id);
+
+  // 立即以预约墙钟为锚点把进度推到 now：撞上停点/超载边界/末尾则一并惰性落库
+  const started = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+  const prog2 = getRoomProgram(row.id);
+  computeRoomState(started, { now, guard, persistStopped: true, prog: prog2, stops });
+  return true;
+}
+
+function activateDueSchedule(roomId, now = Date.now() / 1000) {
+  return db.transaction(() => activateDueScheduleTx(roomId, now))();
+}
+
 // 组装对外的超载保护状态块（页面据此显示保护状态与触发原因）
 function buildProtection(row, state, guard) {
   if (!row.overload_protection) return { enabled: false };
@@ -1847,8 +1941,41 @@ function buildStopsBlock(row, state, stops) {
   return block;
 }
 
+// 定时启播对外状态块（创建/查询/控制/编排/停点/交接/预约响应一致；观看者只读可见）。
+//  - 无预约且当前状态非预约启播：state="none"；
+//  - 待生效（未来墙钟）：state="pending"，附预约墙钟、剩余秒数与预约时断点（启播时
+//    将从该时码启动；已走完的循环排演会从首段重来，program_restart 标注）；
+//  - 预约已自动启播（rooms.scheduled_start_at 非空）：state="started"，附实际启播
+//    墙钟；本次启播的结果（播放中 / 停在停点 / 超载边界 / 版本末尾）由 playing 与
+//    stops.tripped / protection.tripped 块呈现。任何字段都不包含控制密钥。
+function buildScheduleBlock(row, state, now, guard, prog, sched) {
+  if (sched) {
+    const start = resolveScheduleStart(
+      row,
+      { time: state.time, prog: state.prog },
+      prog
+    );
+    return {
+      state: 'pending',
+      start_at: round6(sched.start_at),
+      seconds_remaining: round6(Math.max(0, sched.start_at - now)),
+      from_time: round6(start.time),
+      program_restart: !!(prog && prog.finished),
+    };
+  }
+  if (row.scheduled_start_at !== null && row.scheduled_start_at !== undefined) {
+    return {
+      state: 'started',
+      start_at: round6(row.scheduled_start_at),
+      reason_text:
+        '定时启播已执行：到点按预约的墙钟时刻自动播放（自动启播不增加控制修订号）；若播放已结束，则停在先遇到的讨论停点、超载边界或版本末尾。成功的手动控制会取消待生效预约并清除本标记',
+    };
+  }
+  return { state: 'none' };
+}
+
 // 房间对外视图（创建/查询/控制/交接共用）；state 由 computeRoomState 得到
-function buildRoomView(row, state, now, guard, prog, stops) {
+function buildRoomView(row, state, now, guard, prog, stops, sched) {
   const view = {
     code: row.code,
     label: row.label,
@@ -1861,6 +1988,15 @@ function buildRoomView(row, state, now, guard, prog, stops) {
     protection: buildProtection(row, state, guard),
     // 讨论停点：预置列表 + 触发/预告状态（观看者同样可见，无密钥字段）
     stops: buildStopsBlock(row, state, stops === undefined ? getRoomStops(row.id) : stops),
+    // 定时启播：待生效预约 / 已启播标记（观看者同样可见，无密钥字段）
+    schedule: buildScheduleBlock(
+      row,
+      state,
+      now,
+      guard,
+      prog === undefined ? getRoomProgram(row.id) : prog,
+      sched === undefined ? getRoomSchedule(row.id) : sched
+    ),
     // 服务端墙钟与对应时码：观看端据此校时（基准时码 + 流逝时间 × 速度）
     server_wall: now,
     server_time: round6(state.time),
@@ -1929,16 +2065,21 @@ app.get('/api/rooms/:code', (req, res) => {
   let row = getRoomRowByCode(code);
   if (!row) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重新加入）`);
   const now = Date.now() / 1000;
+  // 定时启播：到点（含服务重启后首次查询已晚于预约时刻）先惰性启播并按预约墙钟推算，
+  // 再按既有规则把到末尾 / 撞上超载边界 / 经过讨论停点的结果一并惰性落库
+  const fired = activateDueSchedule(row.id, now);
+  if (fired) row = getRoomRowByCode(code);
   const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
   // 到末尾自动停住 / 撞上超载边界 / 经过讨论停点自动暂停：此处惰性落库，刷新/重启/重连后状态一致
   let prog = getRoomProgram(row.id);
   const stops = getRoomStops(row.id);
+  const sched = getRoomSchedule(row.id);
   const state = computeRoomState(row, { now, guard, persistStopped: true, prog, stops });
   if (!state.playing) {
     row = getRoomRowByCode(code);
     prog = getRoomProgram(row.id);
   }
-  res.json(buildRoomView(row, state, now, guard, prog, stops));
+  res.json(buildRoomView(row, state, now, guard, prog, stops, sched));
 });
 
 // 房间控制：持密钥者播放/暂停/跳转/设置速度；携带修订号，过期 409 且不改房间
@@ -2003,7 +2144,7 @@ app.post('/api/rooms/:code/control', (req, res) => {
   const stops = getRoomStops(row.id);
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
-    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    let cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
     // 事务内复查密钥与修订号（双保险）
     if (cur.control_key !== key) {
       const e = new Error('ROOM_FORBIDDEN');
@@ -2016,6 +2157,11 @@ app.post('/api/rooms/:code/control', (req, res) => {
       e.current = cur.revision;
       throw e;
     }
+    // 成功的手动控制：先让已到点的预约按绝对墙钟惰性启播（本次控制随后接续），
+    // 再取消任何（含尚未到点的）待生效预约——与“手动控制取消待生效预约”同一口径。
+    activateDueScheduleTx(cur.id, now);
+    cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
     // 先按墙钟实时推算（可能已到末尾、已撞上超载边界或经过讨论停点；此处不落库，随本次控制一并固化）
     const curProg = getRoomProgram(cur.id);
     const live = computeRoomState(cur, { now, guard, prog: curProg, stops });
@@ -2124,7 +2270,7 @@ app.post('/api/rooms/:code/control', (req, res) => {
     db.prepare(
       `UPDATE rooms
        SET playing = ?, time = ?, anchor_wall = ?, speed = ?, revision = revision + 1,
-           tripped_circuit_id = ?, tripped_time = ?, stopped_time = ?
+           tripped_circuit_id = ?, tripped_time = ?, stopped_time = ?, scheduled_start_at = NULL
        WHERE id = ?`
     ).run(playing ? 1 : 0, time, anchor, nextSpeed, tripCircuit, tripTime, stopTime, cur.id);
     if (cancelProgram) {
@@ -2185,8 +2331,9 @@ app.post('/api/rooms/:code/control', (req, res) => {
   }
 
   const updatedProg = getRoomProgram(row.id);
+  const updatedSched = getRoomSchedule(row.id);
   const state = computeRoomState(updated, { now, guard, prog: updatedProg, stops });
-  res.json(buildRoomView(updated, state, now, guard, updatedProg, stops));
+  res.json(buildRoomView(updated, state, now, guard, updatedProg, stops, updatedSched));
 });
 
 /* ----------------------- 共享房间循环排演（1～8 段循环） ----------------------- */
@@ -2320,11 +2467,15 @@ app.post('/api/rooms/:code/program', (req, res) => {
       e.current = cur.revision;
       throw e;
     }
+    // 成功提交编排属于成功的手动控制：先启播到点预约，再取消任何待生效预约
+    activateDueScheduleTx(cur.id, now);
+    db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
     // 成功提交：从首段起点开始播放，修订号 +1；清除旧编排与既有触发标记
     db.prepare(
       `UPDATE rooms
        SET playing = 1, time = ?, anchor_wall = ?, speed = speed, revision = revision + 1,
-           tripped_circuit_id = NULL, tripped_time = NULL, stopped_time = NULL
+           tripped_circuit_id = NULL, tripped_time = NULL, stopped_time = NULL,
+           scheduled_start_at = NULL
        WHERE id = ?`
     ).run(segments[0].start, now, cur.id);
     db.prepare(
@@ -2355,8 +2506,9 @@ app.post('/api/rooms/:code/program', (req, res) => {
   }
 
   const prog = getRoomProgram(updated.id);
+  const sched = getRoomSchedule(updated.id);
   const state = computeRoomState(updated, { now, guard, prog });
-  res.json(buildRoomView(updated, state, now, guard, prog));
+  res.json(buildRoomView(updated, state, now, guard, prog, getRoomStops(updated.id), sched));
 });
 
 // POST /api/rooms/:code/program/clear  手动取消循环排演：
@@ -2377,7 +2529,7 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
   const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
-    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    let cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
     if (cur.control_key !== key) {
       const e = new Error('ROOM_FORBIDDEN');
       e.code = 'ROOM_FORBIDDEN';
@@ -2389,13 +2541,17 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
       e.current = cur.revision;
       throw e;
     }
+    // 成功取消编排属于成功的手动控制：先启播到点预约，再取消任何待生效预约
+    activateDueScheduleTx(cur.id, now);
+    cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
     // 先按墙钟实时推算（含编排映射），把当前进度固化为普通房间时码，再取消编排
     const curProg = getRoomProgram(cur.id);
     const live = computeRoomState(cur, { now, guard, prog: curProg });
     db.prepare(
       `UPDATE rooms
        SET playing = ?, time = ?, anchor_wall = ?, revision = revision + 1,
-           tripped_circuit_id = ?, tripped_time = ?, stopped_time = ?
+           tripped_circuit_id = ?, tripped_time = ?, stopped_time = ?, scheduled_start_at = NULL
        WHERE id = ?`
     ).run(
       live.playing ? 1 : 0,
@@ -2428,7 +2584,7 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
   }
 
   const state = computeRoomState(updated, { now, guard, prog: null });
-  res.json(buildRoomView(updated, state, now, guard, null));
+  res.json(buildRoomView(updated, state, now, guard, null, getRoomStops(updated.id), getRoomSchedule(updated.id)));
 });
 
 /* ----------------------- 共享房间讨论停点（整组替换） ----------------------- */
@@ -2497,7 +2653,7 @@ app.put('/api/rooms/:code/stops', (req, res) => {
 
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
-    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    let cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
     // 事务内复查密钥与修订号（双保险）
     if (cur.control_key !== key) {
       const e = new Error('ROOM_FORBIDDEN');
@@ -2510,6 +2666,10 @@ app.put('/api/rooms/:code/stops', (req, res) => {
       e.current = cur.revision;
       throw e;
     }
+    // 成功维护停点属于成功的手动控制：先启播到点预约，再取消任何待生效预约
+    activateDueScheduleTx(cur.id, now);
+    cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
     // 整组原子替换：空组 = 清除全部停点（删除行）
     if (stops.length === 0) {
       db.prepare('DELETE FROM room_stops WHERE room_id = ?').run(cur.id);
@@ -2524,7 +2684,7 @@ app.put('/api/rooms/:code/stops', (req, res) => {
       cur.stopped_time !== null &&
       cur.stopped_time !== undefined &&
       stops.some((s) => Math.abs(s - cur.stopped_time) <= ROOM_EPS);
-    db.prepare('UPDATE rooms SET revision = revision + 1, stopped_time = ? WHERE id = ?').run(
+    db.prepare('UPDATE rooms SET revision = revision + 1, stopped_time = ?, scheduled_start_at = NULL WHERE id = ?').run(
       keepStopped ? cur.stopped_time : null,
       cur.id
     );
@@ -2550,8 +2710,222 @@ app.put('/api/rooms/:code/stops', (req, res) => {
 
   const guard = updated.overload_protection ? loadRoomGuard(updated.version_id) : null;
   const prog = getRoomProgram(updated.id);
+  const sched = getRoomSchedule(updated.id);
   const state = computeRoomState(updated, { now, guard, prog, stops });
-  res.json(buildRoomView(updated, state, now, guard, prog, stops));
+  res.json(buildRoomView(updated, state, now, guard, prog, stops, sched));
+});
+
+/* ----------------------- 共享房间定时启播（预约未来墙钟时刻） ----------------------- */
+// 暂停房间的主持人凭当前控制密钥与房间修订号预约一个【未来墙钟时刻】：到点按现有
+// 播放规则从当时断点启动（已完成的循环排演从首段重来），自动启播不增加修订号。
+// 同一房间只保留最近一次预约（再次预约覆盖旧预约），也可专门取消；预约与取消各使
+// 修订号 +1。启播按绝对墙钟：服务重启或首次查询已晚于预约时刻，仍按预约时刻起算
+// 进度，由现有惰性推算准确停在先遇到的讨论停点、超载边界或版本末尾，且绝不重复
+// 启播。成功的手动控制 / 编排 / 停点维护会取消待生效预约；主持权交接保留预约。
+// 无权、过期修订号、非未来时刻、播放中预约、不安全（已超载）起点均明确拒绝且
+// 房间不变。所有响应只报告预约状态与启播结果，不泄露控制密钥。
+
+// 解析启播墙钟：接受 Unix 秒（数字或数字字符串）或 ISO 8601 时间字符串；返回秒或 NaN
+function parseScheduleWall(input) {
+  if (typeof input === 'number') return Number.isFinite(input) ? input : NaN;
+  if (typeof input !== 'string' || input.trim() === '') return NaN;
+  const s = input.trim();
+  if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms / 1000 : NaN;
+}
+
+// PUT /api/rooms/:code/schedule  预约/替换定时启播：
+// {control_key, revision, start_at}（Unix 秒或 ISO 8601，须为未来墙钟时刻）
+app.put('/api/rooms/:code/schedule', (req, res) => {
+  const code = normalizeRoomCode(req.params.code);
+  if (code.length !== ROOM_CODE_LEN) {
+    return err(res, 400, `房间码无效：${JSON.stringify(req.params.code)}（须为 ${ROOM_CODE_LEN} 位房间码）`);
+  }
+  const row0 = getRoomRowByCode(code);
+  if (!row0) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重试）`);
+
+  // 启播时刻：必填，数字（Unix 秒）或 ISO 8601 字符串
+  if (!('start_at' in (req.body || {}))) {
+    return err(res, 400, '预约必须携带启播墙钟时刻 start_at（Unix 秒数或 ISO 8601 日期时间字符串）');
+  }
+  const startAt = parseScheduleWall(req.body.start_at);
+  if (Number.isNaN(startAt)) {
+    return err(
+      res,
+      400,
+      `启播时刻无效：${JSON.stringify(req.body.start_at)}（须为未来的 Unix 秒数或 ISO 8601 日期时间）`
+    );
+  }
+
+  // 先鉴权（与控制/停点同一口径；以下拒绝均不改动房间）
+  const auth = authorizeRoomControl(req, res, row0, '预约定时启播');
+  if (auth === 403 || auth === 400) return;
+  const { key, clientRev } = auth;
+
+  const now0 = Date.now() / 1000;
+  // 非未来时刻：明确拒绝（等当前时刻也不允许——只接受未来墙钟）
+  if (!(startAt > now0 + ROOM_EPS)) {
+    return err(res, 400, `启播时刻必须是未来时刻：${round6(startAt)} 不晚于当前墙钟 ${round6(now0)}（本次未改动房间）`);
+  }
+  // 到点的旧预约先按绝对墙钟惰性启播（启播后房间将处于播放/自动暂停状态，下面据此拒绝）
+  activateDueSchedule(row0.id, now0);
+
+  const guard0 = row0.overload_protection ? loadRoomGuard(row0.version_id) : null;
+  const row1 = getRoomRowByCode(code);
+  const prog1 = getRoomProgram(row1.id);
+  const stops1 = getRoomStops(row1.id);
+  const live1 = computeRoomState(row1, { now: now0, guard: guard0, prog: prog1, stops: stops1 });
+
+  // 仅暂停的房间可以预约；播放中（含旧预约刚到点启播后仍在播放）明确拒绝
+  if (live1.playing) {
+    return err(res, 400, '房间正在播放：定时启播只能为暂停的房间预约，请先暂停后再预约（本次未改动房间）');
+  }
+  // 没有 Cue 的 0 时长版本无法播放（与手动 play 同一口径）
+  if (row1.duration <= 0) {
+    return err(res, 400, '该房间固定的版本时长为 0（没有 Cue），无法启播（本次未改动房间）');
+  }
+
+  // 不安全起点：预约启播时的起点已处于超载区间则拒绝（与手动 play 的不安全起点同一判定）
+  const start = resolveScheduleStart(row1, live1, prog1);
+  if (guard0) {
+    const over = overloadedCircuitsAt(guard0, start.time);
+    if (over.length > 0) {
+      const names = over.map((c) => `回路 #${c.circuit_id}「${c.name}」`).join('、');
+      return res.status(400).json({
+        error: `预约启播起点 ${round6(start.time)} 秒处 ${names} 负载严格大于容量：启播起点不安全，预约被拒绝；请先在暂停状态下跳转到安全时码（本次未改动房间）`,
+        reason: 'overloaded_timecode',
+        time: round6(start.time),
+        circuits: over,
+      });
+    }
+  }
+
+  const now = now0;
+  const tx = db.transaction(() => {
+    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row1.id);
+    // 事务内复查密钥与修订号（双保险）
+    if (cur.control_key !== key) {
+      const e = new Error('ROOM_FORBIDDEN');
+      e.code = 'ROOM_FORBIDDEN';
+      throw e;
+    }
+    if (cur.revision !== clientRev) {
+      const e = new Error(`ROOM_CONFLICT:${cur.revision}`);
+      e.code = 'ROOM_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+    // 同一房间只保留最近一次预约：UPSERT 覆盖旧预约；修订号 +1。
+    // 预约期间房间保持暂停（时码/锚点/速度都不动），清除上一轮预约启播标记。
+    db.prepare(
+      `INSERT INTO room_schedules (room_id, start_at) VALUES (?, ?)
+       ON CONFLICT (room_id) DO UPDATE SET start_at = excluded.start_at`
+    ).run(cur.id, startAt);
+    db.prepare('UPDATE rooms SET revision = revision + 1, scheduled_start_at = NULL WHERE id = ?').run(cur.id);
+    return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
+  });
+
+  let updated;
+  try {
+    updated = tx();
+  } catch (e) {
+    if (e.code === 'ROOM_CONFLICT') {
+      return err(
+        res,
+        409,
+        `修订号冲突：预约基于修订号 ${clientRev}，房间当前已为修订号 ${e.current}；请按服务端最新状态校时后重试（本次未改动房间）`
+      );
+    }
+    if (e.code === 'ROOM_FORBIDDEN') {
+      return err(res, 403, '控制密钥无效：无权为该房间预约定时启播（本次未改动房间）');
+    }
+    throw e;
+  }
+
+  const guard = updated.overload_protection ? loadRoomGuard(updated.version_id) : null;
+  const prog = getRoomProgram(updated.id);
+  const stops = getRoomStops(updated.id);
+  const sched = getRoomSchedule(updated.id);
+  const state = computeRoomState(updated, { now, guard, prog, stops });
+  res.json(buildRoomView(updated, state, now, guard, prog, stops, sched));
+});
+
+// POST /api/rooms/:code/schedule/cancel  取消待生效预约：{control_key, revision}
+// 到点预约会先惰性启播（绝不重复启播）；取消成功修订号 +1；无待生效预约则 400 且房间不变
+app.post('/api/rooms/:code/schedule/cancel', (req, res) => {
+  const code = normalizeRoomCode(req.params.code);
+  if (code.length !== ROOM_CODE_LEN) {
+    return err(res, 400, `房间码无效：${JSON.stringify(req.params.code)}（须为 ${ROOM_CODE_LEN} 位房间码）`);
+  }
+  const row0 = getRoomRowByCode(code);
+  if (!row0) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重试）`);
+
+  const auth = authorizeRoomControl(req, res, row0, '取消定时启播');
+  if (auth === 403 || auth === 400) return;
+  const { key, clientRev } = auth;
+
+  const now = Date.now() / 1000;
+  // 已到点的预约先惰性启播（启播不增加修订号；启播后无待生效预约可取消）
+  activateDueSchedule(row0.id, now);
+  if (!getRoomSchedule(row0.id)) {
+    return err(res, 400, '当前没有待生效的定时启播预约（可能从未预约、已被手动控制取消，或已到点启播；本次未改动房间）');
+  }
+
+  const tx = db.transaction(() => {
+    const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row0.id);
+    if (cur.control_key !== key) {
+      const e = new Error('ROOM_FORBIDDEN');
+      e.code = 'ROOM_FORBIDDEN';
+      throw e;
+    }
+    if (cur.revision !== clientRev) {
+      const e = new Error(`ROOM_CONFLICT:${cur.revision}`);
+      e.code = 'ROOM_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+    // 事务内再次确认仍有待生效预约（并发双保险）
+    const s = db.prepare('SELECT start_at FROM room_schedules WHERE room_id = ?').get(cur.id);
+    if (!s) {
+      const e = new Error('ROOM_NO_SCHEDULE');
+      e.code = 'ROOM_NO_SCHEDULE';
+      throw e;
+    }
+    db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
+    db.prepare('UPDATE rooms SET revision = revision + 1 WHERE id = ?').run(cur.id);
+    return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
+  });
+
+  let updated;
+  try {
+    updated = tx();
+  } catch (e) {
+    if (e.code === 'ROOM_CONFLICT') {
+      return err(
+        res,
+        409,
+        `修订号冲突：取消基于修订号 ${clientRev}，房间当前已为修订号 ${e.current}；请按服务端最新状态校时后重试（本次未改动房间）`
+      );
+    }
+    if (e.code === 'ROOM_FORBIDDEN') {
+      return err(res, 403, '控制密钥无效：无权取消该房间的定时启播预约（本次未改动房间）');
+    }
+    if (e.code === 'ROOM_NO_SCHEDULE') {
+      return err(res, 400, '当前没有待生效的定时启播预约（可能已到点启播；本次未改动房间）');
+    }
+    throw e;
+  }
+
+  const guard = updated.overload_protection ? loadRoomGuard(updated.version_id) : null;
+  const prog = getRoomProgram(updated.id);
+  const stops = getRoomStops(updated.id);
+  const sched = getRoomSchedule(updated.id);
+  const state = computeRoomState(updated, { now, guard, prog, stops });
+  res.json(buildRoomView(updated, state, now, guard, prog, stops, sched));
 });
 
 /* ----------------------- 主持权交接（一次性五分钟凭证） ----------------------- */

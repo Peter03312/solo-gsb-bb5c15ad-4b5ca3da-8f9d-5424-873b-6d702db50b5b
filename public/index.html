@@ -138,6 +138,7 @@
           <div id="room-handover" class="room-handover" hidden></div>
           <div id="room-protection" class="room-protection" hidden></div>
           <div id="room-stops" class="room-stops" hidden></div>
+          <div id="room-schedule" class="room-schedule" hidden></div>
           <div class="row transport" id="room-transport">
             <button id="btn-room-play" class="primary">▶ 播放</button>
             <button id="btn-room-pause">⏸ 暂停</button>
@@ -224,6 +225,34 @@
 
           <div id="room-stops-viewer" class="muted" hidden>
             观看者只读：停点列表与触发状态见上方状态条；维护停点仅持密钥者可用。
+          </div>
+        </div>
+
+        <!-- 定时启播（主持人为暂停房间预约未来墙钟时刻；到点自动播放） -->
+        <div class="card" id="room-schedule-card">
+          <h2>定时启播</h2>
+          <p class="muted">
+            主持人可为<strong>暂停的房间</strong>预约一个未来墙钟时刻：到点按现有播放规则<strong>从当时断点自动播放</strong>
+            （已完成的循环排演会从首段重来）。同一房间只保留<strong>最近一次预约</strong>，也可取消；
+            预约与取消各使修订号 +1，<strong>自动启播不增加修订号</strong>。
+            服务重启或到点时无人查询，仍按预约时刻起算墙钟进度，准确停在先遇到的讨论停点、超载边界或版本末尾，且不会重复启播。
+            <strong>任何成功的手动控制（播放/暂停/跳转/改速、循环排演、停点维护）都会取消待生效预约</strong>；主持权交接保留预约。
+          </p>
+
+          <div id="room-schedule-host">
+            <div class="row">
+              <label>启播时刻（本机时间）
+                <input type="datetime-local" id="room-schedule-at" step="1" style="width:15rem" />
+              </label>
+              <button type="button" id="btn-room-schedule-set" class="primary">⏰ 预约定时启播</button>
+              <button type="button" id="btn-room-schedule-cancel">取消预约</button>
+              <span class="muted">预约期间房间保持暂停；到点自动播放。</span>
+            </div>
+            <div id="room-schedule-error" class="error-line" hidden></div>
+          </div>
+
+          <div id="room-schedule-viewer" class="muted" hidden>
+            观看者只读：预约状态与启播结果见上方状态条；预约与取消仅持密钥者可用。
           </div>
         </div>
 
